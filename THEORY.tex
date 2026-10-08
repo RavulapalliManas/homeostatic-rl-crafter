@@ -1,0 +1,564 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+\title{Homeostatic reinforcement learning on Crafter: what we did, what we found, and a theory}
+\author{Manas Ravulapalli}
+\date{9 October 2026, Draft 2}
+
+\begin{document}
+\maketitle
+
+Draft 2, 9 Oct 2026. Draft 1 was reviewed by five independent reviewers (numbers, citations, RL theory, alignment and prior work, readability). \texttt{REVIEW\_LOG.md} in this folder lists what each found and what changed.
+
+\section*{In short}
+
+We built an agent with a simulated body and tested whether body signals make it learn Crafter faster. One effect held up on fresh seeds. Learning speed rises from low to moderate depletion of the body and falls again at very high depletion, with the best of our tested levels at 6$\times$ the native rate. When we fixed the exploration temperature, the rise from 1$\times$ to 6$\times$ was no longer detectable, but the fall to 24$\times$ stayed. A fixed temperature at 1$\times$ scored 4.03, about as well as the best pressure arm. Two other results held: training where the agent can die beats training where it cannot, and the dense body reward helps only when death is possible.
+
+The full brain-inspired agent failed. It scored 2.47 against 3.79 for plain PPO. On a repaired backbone, adding the modules together still lowered the score. A childhood stage and a memory module did not help. No body signal has yet beaten the best plain baseline, which is plain PPO with a fixed temperature.
+
+The theory in section 4 explains these results with one idea: a body signal helps only through a channel that the learner cannot get some other way, and only when the body actually matters to the task.
+
+\section*{How this document is organised}
+
+Section 1 gives the motivation. Section 2 gives the question. Section 3 gives the record: what held, what failed, and why. Section 4 gives the theory. Sections 5 and 6 extend it to sample efficiency and to alignment. Section 7 lists open items, and section 8 defines terms.
+
+Each statement in section 4 has one of four labels:
+
+\begin{itemize}
+\item \textbf{Proved}: a short derivation is given.
+\item \textbf{Measured}: a logged number supports it.
+\item \textbf{Hypothesis}: no run has tested it.
+\item \textbf{Design rule}: a recommendation that follows from the results. It is not a claim about the world.
+\end{itemize}
+
+Every number in section 3 comes from \texttt{research/plans/organism\_crafter\_2026-09-27/STAGE\_REPORT.md}, which names the S3 result file for each number. Nothing was recomputed from raw runs for this document. Where a p-value appears, its sidedness follows the stage report.
+
+\section{Why we started}
+
+\subsection{The starting idea}
+
+Most reinforcement-learning agents get a score to maximise and nothing else. An animal is different. It has a body that can fail, and everything it does serves the job of staying alive. The idea behind this program is to build an agent the way biology builds an animal, and to see whether that makes it learn from fewer samples.
+
+There were two reasons to start from a body. The practical reason is that a body gives the agent a reason to act in every situation, with no hand-written list of goals. The philosophical reason is that it makes survival the root of the whole system. Everything else the agent does becomes a tool for staying alive.
+
+\subsection{The parts of an organism}
+
+The design listed the parts that an artificial organism might need. None of them is new on its own. The bet was on what happens when they are put together and made to depend on each other.
+
+\begin{itemize}
+\item \textbf{A body with needs.} A few internal variables drain over time and can be refilled. The agent can die. In homeostatic reinforcement learning (Keramati and Gutkin 2014), reward is the reduction of the gap between the body's state and its set point. A meal is rewarding because you were hungry.
+\item \textbf{One currency.} Every action costs the same internal resources the body runs on. That includes moving, thinking, attending and remembering. One number, the marginal value of those resources, can then set the price of all of it. Economics calls this a shadow price. We write it $\lambda$.
+\item \textbf{Feelings as settings.} In the brain, neuromodulators such as dopamine, serotonin and noradrenaline do not carry the content of an experience. They change how the brain learns: how fast it updates, how much it explores, how far ahead it cares. Doya (2002) proposed this mapping. We treat emotion in the agent the same way. A feeling is a signal that sets a learning setting, such as the exploration temperature.
+\item \textbf{Curiosity.} An agent that acts only on current needs never finds anything new. Curiosity pushes it toward situations it cannot yet predict.
+\item \textbf{Memory and a map.} The agent should remember where the water was and where danger came from. The design borrowed from the hippocampal-entorhinal system: a map that tracks the agent's position in a world larger than its view, and a fast memory.
+\item \textbf{A world model and planning, with a price.} The agent learns to predict what happens next and can imagine before it acts. Thinking costs energy, so the agent should think longer only when more thought is likely to change its choice.
+\item \textbf{A childhood.} Animals do not face the full world at birth. The plan had a pretraining stage (standing in for evolution), then a protected childhood with food supplied, then adult life under full pressure.
+\end{itemize}
+
+\subsection{The claim}
+
+The original claim, from \texttt{SPEC\_v1.md} §1.1: \textit{an organism under constant, moderate survival pressure, whose internal state modulates how it learns, learns from fewer samples than the same learner without that pressure or modulation.}
+
+The spec gave three mechanisms for it:
+
+\begin{enumerate}
+\item \textbf{Pressure is a dense signal.} When reward is tied to the body, every step carries information. The agent never learns in silence between rare successes.
+\item \textbf{Pressure sets priorities.} The price decides what is worth attending to, remembering and thinking about.
+\item \textbf{Emotion sets the meta-parameters.} Valence and arousal, computed from the body, set the learning rate, exploration, time horizon and memory strength.
+\end{enumerate}
+
+It also made a prediction: learning speed would be an inverted U in pressure. Too little pressure gives no signal, and too much pressure hurts. Emotional modulation would raise the curve and move its peak. The stretch goal was the human baseline on Crafter at 1M steps.
+
+\subsection{How the idea changed}
+
+On 29 Sep the design became simpler. Two signals would drive everything: energy maintenance and curiosity. Those two signals would control all the learning settings. Early life would be pretraining under a parent. The many hand-set constants would reduce to a few natural scales plus set-point corrections. (Sources: \texttt{DEVELOPMENT\_v6.md} and the project memory note of 29 Sep.)
+
+\subsection{A later idea: alignment}
+
+The link to alignment came after the experiments. The alignment idea is that a need can be satisfied and a score cannot. So an agent whose drives come from a body with set points might have goals that are easier to bound. Section 6 tests that idea on paper and finds that it holds only in part.
+
+\section{The question}
+
+\textbf{Can signals from a simulated body make a reinforcement-learning agent learn faster, and if so, through which channel?}
+
+We use Crafter (Hafner 2022), through Craftax-Classic, a JAX version of the same game. Crafter is a 2D survival game. The agent gathers resources, crafts tools, eats, drinks, sleeps and avoids monsters. It has a day and night cycle, and the agent can die. The Crafter score is the geometric mean of the success rates of 22 achievements.
+
+Our main metric is the \textbf{mean evaluation score over training}. We evaluate the agent at 8 checkpoints spread over 1M training steps and take the mean of the 8 Crafter scores. The stage report calls this ``AUC'', because it is proportional to the area under the learning curve. A higher value means the agent learned faster, not only that it ended higher. All results below are evaluated at native depletion and native predation, written (1, 1).
+
+\section{What we did and what we found}
+
+\subsection{The two lines of work}
+
+We ran two lines in parallel.
+
+\begin{itemize}
+\item \textbf{Line A} is a plain learner with a body. It is model-free PPO with a GRU, a small recurrent network. The body enters through the reward and through the inputs. The body also sets the exploration temperature through the price. Line A is cheap, so it carries the pressure experiments.
+\item \textbf{Line B} is the full organism. It has a transformer core and a world model, plus seven modules: memory, path integration, an attention priority map, arousal, halting (a choice of one or two thinking loops per step), curiosity and planning. Each part copies a brain system.
+\end{itemize}
+
+The design went through five specs (\texttt{SPEC\_v1.md} to \texttt{SPEC\_v5.md}) and one build plan (\texttt{BUILD\_v6.md}). The ``wrapper'' is the code that turns Crafter into the organism's world. The results below use two wrapper versions. The v3 wrapper has a four-variable body (health, food, drink, energy). The v5 wrapper adds a fifth variable, safety, which falls under threat and in darkness.
+
+Compute for 27--28 Sep was about \$41 (\texttt{COMPUTE\_LOG.md}). The BUILD\_v6 lease from 4 Oct was capped at \$30 for Stages 0--1 and another \$30 for Stage 2. The final total for that lease is not summed in the log.
+
+\subsection{The body we gave the agent (v5 wrapper)}
+
+The body state $b$ has five variables, each scaled to $[0, 1]$: health, food, drink, energy and safety. Food, drink and energy drain over time. We call the multiplier on that drain the \textbf{depletion rate} $m$. The project files call it ``need pressure''. At $m = 1$ the drain matches the native game. At $m = 6$ it is six times faster.
+
+The \textbf{drive} is the squared distance of the body from its set point, which is full on every variable:
+
+\[
+D(b) = \sum_i (1 - b_i)^2, \ \text{so} \ 0 \le D \le 5.
+\]
+
+The agent gets two reward streams.
+
+\begin{itemize}
+\item A body stream. In the dense setting it pays $r_{\text{loc}} = -D$ at every step. This is the \textbf{drive level}: the agent is paid for being near the set point. In the sparse setting it pays nothing. In both settings, death adds a one-time penalty of $\gamma \cdot (-5/(1-\gamma)) = -495$, with $\gamma = 0.99$.
+\item An achievement stream. It pays for each new achievement and fades for repeats.
+\end{itemize}
+
+Each stream is divided by its own running return standard deviation before the two advantages are added. The exploration temperature is $\tau = 1/(1 + \lambda/\lambda_{\text{ref}})$. Here $\lambda$ is a price computed from the body state alone, using the drive gradient. So a hungrier body means a higher price and a greedier policy. We call this the \textbf{state-dependent temperature}.
+
+\subsection{The main findings}
+
+\paragraph{R1. Learning speed rises and then falls with the depletion rate.}
+
+\begin{itemize}
+\item The pre-registered test failed first. On a 9 $\times$ 9 grid of training and evaluation rates from 0.25$\times$ to 6$\times$, there was no falling side. The curve rose to about 1.5$\times$ and then stayed flat.
+\item Two more levels were added after that: 12$\times$ and 24$\times$. On those seeds the curve peaked at 6$\times$. Because the levels were chosen after seeing the data, this was not yet a test.
+\item A confirmatory test was declared in the stage report before its runs, on fresh seeds 30--49. At 6$\times$ the score was 4.063, n 20. At 1$\times$ it was 3.750 (one-sided p 0.0007). At 24$\times$ it was 3.762 (p 0.002). Both declared conditions held.
+\item The result replicated a third time in BUILD\_v6 Stage 0. There, 6$\times$ beat 1$\times$ by 0.191 (p 0.035) and 24$\times$ by 0.290 (p 0.007).
+\item Low depletion hurts. Over 30 seeds, 0.25$\times$ scored 0.46 below 1$\times$ (two-sided p 3e-8).
+\item Three limits apply. The size of the 6$\times$ gain varied between seed sets (+0.07 on seeds 0--9, +0.34 on seeds 10--29). The tested levels are 1.5$\times$, 6$\times$, 12$\times$ and 24$\times$, so ``peak at 6$\times$'' means ``best of the levels tried''. And the evaluation is one condition, (1, 1).
+\end{itemize}
+
+\paragraph{R2. With a fixed temperature, the rise from 1$\times$ to 6$\times$ was not detectable.}
+
+\begin{itemize}
+\item This was declared prediction P0.2, and it failed. The prediction was that the rise would survive a fixed temperature.
+\item With the temperature fixed at 0.407 in every arm, 6$\times$ scored 0.049 above 1$\times$ (p 0.28, n 20).
+\item The falling side stayed. 6$\times$ scored 0.306 above 24$\times$ (p 0.0002).
+\item The estimated share of the 1$\times$ to 6$\times$ rise that ran through the temperature was 0.746. This estimate compares a significant gap (0.191) with a non-significant one (0.049). No test of the difference between those two gaps was run.
+\end{itemize}
+
+\paragraph{R3. A fixed temperature beat the state-dependent temperature at 1$\times$.}
+
+\begin{itemize}
+\item At 1$\times$, a fixed temperature scored 4.032 against 3.723 for the state-dependent one: +0.310, two-sided p 0.001, n 20.
+\item The mean temperature was almost the same in both arms (0.407 against 0.418).
+\item At 6$\times$ and 24$\times$ the gap was smaller and not significant (+0.167, p 0.10; +0.151, p 0.12).
+\item The cause is not settled. The two arms also act with different temperatures at evaluation. Re-evaluating the saved weights with the other temperature would separate learning from acting.
+\item This was not a declared prediction.
+\end{itemize}
+
+\paragraph{R4. Training where death is possible beats training where it cannot happen.}
+
+\begin{itemize}
+\item With sparse body reward, training with death scored 3.28. Training with a health floor, where health never falls below 1, scored 2.18. The gain was 1.10 (one-sided p 1.3e-8, n 10).
+\item The confound: the no-death arms are evaluated in the normal game, where they can die. Part of their deficit may be that they never learned to avoid death.
+\end{itemize}
+
+\paragraph{R5. The dense body reward helps only when death is possible.}
+
+\begin{itemize}
+\item With death possible, the dense reward $-D$ scored 0.51 above the sparse arm. Its lead grew over training (p 0.004 in the first half of the checkpoints, p 0.0002 in the second half).
+\item With a health floor, the dense reward changed the score by $-0.01$ (2.17 against 2.18), n 10 per cell.
+\end{itemize}
+
+\subsection{Controls and smaller results}
+
+\paragraph{R6. Predation pressure works the other way from depletion.}
+Training with half the creature damage beat native damage by 0.335 (p 0.024, n 10). Double damage scored 0.251 lower (p 0.057). This has not been replicated, and a memory result at the same n did not replicate.
+
+\paragraph{R7. Depletion did not make the updates much larger.}
+We checked whether pressure acts like a larger learning rate. The mean policy change per update (approximate KL) was 0.0114 at 1$\times$, 0.0134 at 6$\times$ and 0.0133 at 24$\times$. That is an 18\% rise from 1$\times$ to 6$\times$ and no further rise. The declared bar for a learning-rate effect was a ratio of 1.5. The measured 24$\times$ to 1$\times$ ratio was 1.17.
+
+\paragraph{R8. The gains grew over training.}
+In five compared pairs, the lead in checkpoints 5--8 was larger than in checkpoints 1--4. The pairs were dense against sparse, 6$\times$ against 1$\times$ (two seed sets), 6$\times$ against 24$\times$, and fixed against state-dependent temperature. None of the leads shrank. The growth was significant in four pairs (p 0.026 to 0.044) and not in 6$\times$ against 24$\times$ (p 0.15). So within 1M steps, these effects do not look like an early gain paid for later.
+
+\paragraph{R9. In the v3 wrapper, three controls did not explain the rise from 0.5$\times$ to 2.0$\times$.}
+
+\begin{itemize}
+\item Fixing the payment schedule did not remove it.
+\item Fixing the temperature at 0.5 did not remove it (+0.625, p 7.3e-6).
+\item A yoked-lifespan control cuts each life in a native-rate arm at the lifespans of the high-rate arm. It did not reproduce the rise. The yoke gave shorter lives than intended (119 and 131 steps against targets of 150 and 197), so the control is imperfect.
+\end{itemize}
+
+\subsection{What failed}
+
+\paragraph{F1. The full organism learned worse than plain PPO.}
+The first Line B organism scored 2.47 (n 5), against 3.79 for the Line A control (n 10). Its curve stayed flat while the control climbed.
+
+\paragraph{F2. Adding all modules together lowered the score on a repaired backbone.}
+
+\begin{itemize}
+\item We first fixed the backbone with a direct path from the flat view to the recurrent state. The backbone alone (B) scored 4.013, tied with the control at 3.972.
+\item Adding all the modules gave 3.645 (-0.368, p 0.023, n 10).
+\item Five fixes on top gave 3.125. Planning on top of that gave 2.170.
+\item A sixth arm with wiring fixes gave 1.734, but 4 of 10 seeds hit a numerical fault (NaN). That fault is a code bug in the wiring fix, so this arm says nothing about the modules.
+\item Added one at a time to the earlier bare backbone, no single module changed the score detectably (all differences between $-0.11$ and $+0.15$, all $p > 0.3$, n 5). So the harm appears when the modules are combined. No run has isolated which module causes most of it.
+\end{itemize}
+
+\paragraph{F3. The learned price did not work in Line A.}
+The learned price switches on only when the agent can tell a one-unit change in body state from noise in its own value estimate. In Line A that ratio peaked at 0.77 over 5M steps, against a threshold of 1. Every Line A result therefore uses the drive-gradient price. In BUILD\_v6 Stage 2 the gate was redefined (using disagreement between three value heads) and did open. The arms where it opened scored lower than the arms without it.
+
+\paragraph{F4. Behaviour predictions failed, but the test was not fair.}
+Defensive responses to threat (H9), foraging that depends on need (H10) and attention that depends on need (H13) were not supported. H13 had the wrong sign in all 5 seeds. These were tested on the Line B organism, which had not learned to act. So they are not a fair test of the ideas.
+
+\paragraph{F5. A protected childhood did not help on Craftax-Classic.}
+Ending the childhood at 50k steps gave $-0.060$ (one-sided p 0.68, n 10). Ending it at 200k gave $-0.166$ (p 0.93).
+
+\paragraph{F6. Memory did not help.}
+A rule-based memory gave +0.14 on 10 seeds, then $-0.010$ on 20 new seeds.
+
+\paragraph{F7. The inventory as an input did not help.}
+It gave $-0.104$ (one-sided p 0.91). This was declared prediction P0.4.
+
+\subsection{Why the modules hurt}
+
+Two analyses bear on F1 and F2.
+
+The first is a measured decomposition of Line B (n 5 per arm). The world model's training loss cost 0.46 when its gradient flowed into the shared network (p 0.0004). Moving the world model into its own block, with no gradient into the policy's network, removed that cost. The isolated world model still learned.
+
+The second is a log analysis of BUILD\_v6 Stage 2 (\texttt{WHY\_MODULES\_HURT.md}). It found five candidate mechanisms. Each has a label from that file.
+
+\begin{enumerate}
+\item \textbf{Halting decided on noise} (measured, code). The share of steps that used the second loop started at 0.51 and stayed between 0.40 and 0.59 for all of training. The halting head predicts the change in a value estimate between loops, which has an expected value near zero. The halting threshold was also on a different scale from that prediction.
+\item \textbf{Curiosity became a constant bonus} (measured, inferred). It averaged 0.999 per step and held 30\% of the return. A constant bonus per step acts like a bonus for staying alive, and it may dilute the achievement reward.
+\item \textbf{New inputs started empty and kept moving} (inferred). Attention, memory, arousal and price fed the policy before they carried task information. They then changed as their own learners trained.
+\item \textbf{Planning trusted a weak model} (measured, inferred). Planned actions reached 24\% of all actions, and the score fell from 2.56 at 500k steps to 1.74 at 1M. The planner could plan up to 4 steps. The isolated world model's one-step accuracy was 0.69 per cell. No run turned planning off in the same arm, so the cause is not tested.
+\item \textbf{More losses on a shared network} (inferred, not measured). The auxiliary losses add their own gradient to the network the policy uses.
+\end{enumerate}
+
+Deaths do not explain the loss for the arm with all modules or the arm with five fixes. Their lifespans and causes of death match the backbone. The loss is in the harder achievements. The planning arm did die sooner (16 steps shorter lives).
+
+The shared cause, as \texttt{WHY\_MODULES\_HURT.md} puts it: each part was added because the brain has one, and each part sent its signal whether or not the signal was useful yet.
+
+\subsection{A conflict that is not resolved}
+
+R9 and R2 disagree. In the v3 wrapper, a fixed temperature (0.5) kept the rise from 0.5$\times$ to 2.0$\times$. That range includes a rise from 1.0$\times$ to 2.0$\times$ of +0.42. In the v5 wrapper, a fixed temperature (0.407) removed the detectable rise from 1$\times$ to 6$\times$.
+
+The two setups differ in the body (four variables against five), the death value, the fixed temperature and the pressure range. Any of these could explain the difference. The direct test is a v5 run with a fixed temperature at 0.5$\times$ and 2$\times$, to repeat the v3 comparison in the v5 world. A fixed-temperature arm at 1$\times$ already exists (4.032, n 20).
+
+\section{A theory that fits the results}
+
+\subsection{Setup}
+
+The agent lives in a partially observed world. At time $t$ it has an external state $s_t$ and a body state $b_t$. The body drains at a rate set by the depletion rate $m$, and actions such as eating refill it. The drive $D(b)$ measures the distance from the set point.
+
+A body signal can affect learning through five channels:
+
+\begin{enumerate}
+\item \textbf{Reward shape}: which states the body reward marks as good or bad.
+\item \textbf{Reward weight}: how much the body stream counts against the achievement stream after normalisation.
+\item \textbf{Inputs}: the body state given to the policy.
+\item \textbf{Meta-parameters}: learning settings set by the body, such as the temperature.
+\item \textbf{Termination and state distribution}: death ends the episode, which changes which states the agent sees and how often it restarts.
+\end{enumerate}
+
+\subsection{Proposition 1: reward scale alone cannot be the channel}
+
+\textbf{Statement (proved, with conditions checked in our code).} Multiply every reward in one stream by a constant $c > 0$. Then every PPO update in Line A is unchanged, if three conditions hold:
+
+\begin{enumerate}
+\item The critic, its loss and its clipping all work in normalised units.
+\item Advantages are normalised per minibatch.
+\item Nothing else reads the raw reward or the raw value.
+\end{enumerate}
+
+\textbf{Derivation.} Scaling a stream's rewards by $c$ scales its returns by $c$. The running return standard deviation also scales by $c$, so the normalised rewards are unchanged. The critic then learns the same normalised values. GAE advantages are linear in rewards and values, so the advantages are unchanged too. Per-minibatch normalisation removes any remaining overall scale.
+
+\textbf{Check in the code (\texttt{ppo\_v5.py}).} Rewards are divided by the running return standard deviation before GAE. The value clipping is in those normalised units. The price $\lambda$, and so the temperature, comes from the body state alone, not from the value heads. So the three conditions hold in Line A. Two limits remain. Running statistics are not exact early in training. And the small constant 1e-8 in the normaliser matters only for tiny rewards.
+
+\textbf{What follows.} The depletion rate $m$ is not a constant scaling. It changes how the body drains, so it changes the distribution of $D$. So pressure cannot help by ``making the reward bigger''. It must work through one of the other channels in §4.1. One of those channels is easy to miss. Each stream is divided by its own return spread, and the body stream's spread depends on $m$. So the weight of the body stream against the achievement stream changes with $m$, even though no weight was set by hand.
+
+The experiments removed the temperature channel by fixing it (R2, R3). Lifespan was controlled in the v3 wrapper (R9). The reward-weight channel has not been measured. Logging each stream's return spread at each depletion rate would measure it.
+
+\subsection{Proposition 2: drive level changes the goal; drive reduction almost does not}
+
+\textbf{Statement (proved).} Let $\Phi(x) = -D(b)$ be a potential on the full state $x = (s, b)$. Potential-based reward shaping adds $F = \gamma\Phi(x') - \Phi(x)$. Ng, Harada and Russell (1999) proved that $F$ leaves the optimal policy unchanged. Keramati and Gutkin (2014) define the reward as the drive reduction $D(H_t) - D(H_{t+1})$, with $D(H) = (\sum |h^*_i - h_i|^n)^{1/m}$. Our drive is their form with $n = 2$ and $m = 1$. Their reward is undiscounted. With a discount $\gamma$, it splits into two parts:
+
+\[
+D(b_t) - D(b_{t+1}) = [D(b_t) - \gamma D(b_{t+1})] - (1 - \gamma)\cdot D(b_{t+1}).
+\]
+
+The bracket is exactly $F$. The second part is a drive-level penalty with weight $(1 - \gamma)$, which is 0.01 at $\gamma = 0.99$. Expanding both sides confirms the identity.
+
+So the two forms of body reward differ in kind:
+
+\begin{itemize}
+\item \textbf{Drive reduction} is potential-based shaping plus a small level term. It almost leaves the task's optimal policy alone.
+\item \textbf{Drive level}, our $r_{\text{loc}} = -D$, is the level term at full weight. It changes which policy is optimal. The agent is partly optimised to keep the body full, not only to unlock achievements.
+\end{itemize}
+
+\textbf{A caution on the 0.01.} That weight is before normalisation. Our streams are normalised separately, and a drive-reduction stream has a much smaller spread than a drive-level stream. After normalisation, the leftover level term could weigh much more than 1\%. This should be measured before relying on the 0.01.
+
+\textbf{Death and time limits.} In an episodic task with $\gamma < 1$, the shaping argument needs $\Phi = 0$ at the terminal state (Grześ 2017 \textit{[verify]}; Ng et al. 1999 state the $\gamma = 1$ case). That means $D(\text{dead}) = 0$ inside the reward. Then the discounted sum of $F$ telescopes to $-\Phi(x_0)$, which is the same for every policy. At a time limit the episode is cut, not ended, and the sum leaves a term $\gamma^T \Phi(x_T)$ that depends on the policy. Our trainer bootstraps from the value at a cut, which handles this. A drive-reduction version of the wrapper must set $D(\text{dead}) = 0$ and keep that bootstrap.
+
+\textbf{Survival under the drive-level reward.} A per-step reward that is never positive can make death attractive. In the v5 wrapper the worst alive reward is $-D_{\max} = -5$ per step. Staying alive forever in the worst state is worth $-5/(1 - \gamma) = -500$. Dying now costs $\gamma \times 500 = 495$ on top of this step's $-D$. Living one more step in the worst state and then continuing is worth $-D + \gamma(-500)$, which is the same $-D - 495$. So the wrapper sets the death penalty exactly at the worst alive value. Death is never strictly better than living, and in any state better than the worst, living is strictly better. This holds by construction. (Draft 1 used the v3 values and left this unchecked.)
+
+\textbf{Why the level reward still helped.} Policy invariance is about the optimum. Shaping also changes how fast a learner gets there, and that speed is what we measured (R5). Section 4.4 says when that speed-up should appear.
+
+\subsection{Hypothesis 3: body signals help when the body matters to the task}
+
+\textbf{Statement (hypothesis).} A body signal speeds learning to the extent that it tracks the task value. Formally, let $V^*_{\text{task}}(x)$ be the best achievable achievement value from state $x$. The prediction is that the speed-up grows with the share of the variance of $V^*_{\text{task}}$ that $D(b)$ explains, under the states the agent visits. In words: the drive is a useful teacher only when keeping the body well actually helps you score.
+
+\textbf{Where it comes from.} Wiewiora (2003) showed that potential-based shaping is equivalent to starting the value estimate at $\Phi$. So a learner with shaping starts closer to the answer when $\Phi$ is closer to $V^*$. Laud and DeJong (2003) describe the gain as a shorter reward horizon: good shaping lets the learner see the consequences of its actions sooner. Gupta et al. (2022) show that shaping can improve sample efficiency and that the gain depends on the quality of the shaping. None of these papers proves the variance-share form above. It is our hypothesis, motivated by them.
+
+\textbf{What fits it.}
+
+\begin{itemize}
+\item R5. With a health floor, the body cannot cause death, so the body barely affects future achievements. The dense body reward gave $-0.01$. With death possible, the body decides how long the agent lives to score, and the dense reward gave +0.51.
+\item The low end of R1. At 0.25$\times$, food lasts so long that the body rarely limits the agent. Learning was slowest there ($-0.46$ against 1$\times$).
+\item R6, if it replicates. Predation damage may be less controllable by the agent than hunger, which eating fixes. We have not measured how controllable each kind of damage is.
+\end{itemize}
+
+\textbf{What else would produce the same results.} Each of these needs its own test.
+
+\begin{itemize}
+\item \textbf{More restarts.} Shorter lives mean more episodes, and so more practice on the early game, where the common achievements are. This fits R1, R4 and R5 as well as Hypothesis 3 does. The test is to match the number of episodes per update across arms.
+\item \textbf{Dense reward as exploration help.} R5 may be a general dense-reward effect, not a body effect.
+\item \textbf{Evaluation mismatch.} The no-death arms in R4 and R5 are evaluated in a world with death.
+\end{itemize}
+
+\textbf{What would show it is wrong.} A manipulation that makes the body matter more to the task, without changing the depletion rate, and that does not speed learning. For example, low food could reduce attack strength (S3 in section 5).
+
+\subsection{The rise and fall as two terms}
+
+\textbf{Model (hypothesis).} Write learning speed as a shaping benefit minus an opportunity cost:
+
+\[
+L(m) = L_0 + G(m) - C(m).
+\]
+
+\begin{itemize}
+\item $G(m)$ is the \textbf{shaping benefit}: the help the body signal gives the learner. Hypothesis 3 says it rises with $m$ while the body comes to matter more to the task, and then saturates. With the state-dependent temperature, $G$ also includes the temperature effect.
+\item $C(m)$ is the \textbf{opportunity cost}: time and risk spent on the body instead of the task. It rises with $m$.
+\end{itemize}
+
+\textbf{Measured signs of the cost.} From 1$\times$ to 6$\times$ to 24$\times$, in BUILD\_v6 Stage 0:
+
+\begin{itemize}
+\item The share of steps spent asleep rose from 0.111 to 0.319 to 0.420.
+\item Deaths while asleep rose from 4.8\% to 15.5\% to 46.2\%.
+\item Lifespan fell from 173 to 132 to 121 steps.
+\end{itemize}
+
+Sleep share and lifespan change less from 6$\times$ to 24$\times$ than from 1$\times$ to 6$\times$. Only deaths while asleep grow faster. The falling side survived a fixed temperature (R2), as a cost term with no temperature part should.
+
+\textbf{Making the model testable.} As written, two unspecified rising curves can fit any single peak. To make it testable we commit to forms: $G(m) = g \cdot m/(m + m_0)$ and $C(m) = c \cdot m^p$. We fit them on 1$\times$, 6$\times$ and 24$\times$ and predict the held-out 0.25$\times$ and 12$\times$ levels. The model then makes two further predictions:
+
+\begin{enumerate}
+\item If the body matters more to the task (S3), the peak moves to a higher depletion rate.
+\item With a fixed temperature, $G$ shrinks and $C$ does not.
+\end{enumerate}
+
+\textbf{A caution.} R3 shows the state-dependent temperature costs 0.31 at 1$\times$ against a fixed temperature. The cost is smaller and not significant at higher rates. So part of the ``benefit'' of 6$\times$ may be that high depletion reduces a cost that the temperature coupling itself created. The best agents we have use a fixed temperature (4.032 at 1$\times$, 4.081 at 6$\times$). Under fixed temperature, the difference between 1$\times$ and 6$\times$ is not detectable.
+
+\subsection{Design rule A: a body-driven setting needs a target}
+
+\textbf{Rule.} A body signal that sets a meta-parameter should drive that setting toward a measured target. A setting that simply follows the body adds variation without a known benefit.
+
+\textbf{What it rests on.} R3: the temperature that followed the body lost 0.31 to a fixed temperature with the same mean. The cause is not yet separated from evaluation effects. Halting (section 3.6, item 1) compared quantities on different scales and never learned.
+
+\textbf{Grounding.} In Doya's (2002) framework, each neuromodulator tunes a meta-parameter to serve learning. That is a control problem with an objective, not a fixed mapping. In deep RL, a working example is soft actor-critic's automatic temperature tuning, which drives the policy entropy to a target value (Haarnoja et al. 2018).
+
+\textbf{The full rule.} Each internal signal must do one of two things:
+
+\begin{enumerate}
+\item carry information the policy cannot get any other way; or
+\item drive a controller of a meta-parameter that has a measurable target.
+\end{enumerate}
+
+If a signal enters the reward, it should be potential-based. S1 in section 5 tests whether that is better in practice.
+
+\subsection{Design rule B: buy computation only when it can change the action}
+
+\textbf{Rule.} Extra thinking, such as a second loop or a plan, is worth its cost only when the expected improvement in the chosen action exceeds that cost, with both in the same units. This is the value of computation (VOC) from rational metareasoning (Russell and Wefald 1991 \textit{[verify]}; Lieder and Griffiths 2017).
+
+\textbf{What it rests on.} The halting head predicted a change in a value estimate, not a change in the action, and its threshold was in other units. The planner used a model with 0.69 one-step accuracy per cell, for up to 4 steps. If per-cell errors were independent, a whole 4-step chain of one cell would be right about $0.69^4 \approx 0.23$ of the time. Errors in model rollouts compound with length, which is why model-based RL keeps rollouts short where the model is weak (Janner et al. 2019).
+
+\section{Extension 1: homeostasis as a source of sample efficiency}
+
+The theory says where a gain in sample efficiency can come from and where it cannot. Each hypothesis below has a test. The measured cost is about 220--280 minutes per 10-seed block at \$1.861/h, about \$7--9 per block (\texttt{WHY\_MODULES\_HURT.md} §4). Each test needs a price and an approval before launch.
+
+\paragraph{S1. Drive reduction against drive level, at 6$\times$.}
+Replace $r_{\text{loc}} = -D$ with $D(b_t) - D(b_{t+1})$, with $D(\text{dead}) = 0$. Prediction: the score is at least equal, and the harder achievements rise, because the goal is no longer partly ``stay full''. If drive reduction scores lower, the level term is doing useful work as a survival incentive.
+
+\paragraph{S2. A need-driven temperature controller with a target.}
+Set a target entropy as a function of the drive, and let a controller reach it. Prediction: it beats the fixed temperature at 6$\times$. If it ties the fixed temperature at 0.407, then the temperature result does not turn into a useful controller. Before running this, read the 2019 Chalmers thesis on exploration from internal variables (link in \texttt{PROVENANCE.md}), which may have tested something close to it.
+
+\paragraph{S3. Make the body matter more to the task, at a fixed depletion rate.}
+For example, low food could reduce attack damage, or low energy could slow movement. Prediction: the score rises with that coupling, and the peak of the rise-and-fall curve moves to a higher rate. This is the direct test of Hypothesis 3.
+
+\paragraph{S4. Controllable against uncontrollable pressure.}
+Replicate R6 at 20 seeds. Then add an arm where creature damage can be avoided by a learnable action, such as a shelter that blocks it. Prediction: once damage becomes controllable, more of it helps, as depletion does.
+
+\paragraph{S5. The same body layer on a strong world-model agent.}
+\texttt{DREAMERV3\_HOMEOSTASIS.md} specifies the changes to DreamerV3, and Manas makes that edit. Prediction: the body as an observation, plus drive-reduction shaping, raises DreamerV3's Crafter score at 1M steps. This tests whether the effect survives on a learner that already predicts well.
+
+\paragraph{S6. Add modules one at a time.}
+A module joins only if its signal passes a function test when it is used, and if adding it to the backbone does not lower the score. The screen is 10 seeds and the confirmation is 20. The first candidates are tests E0--E4 in \texttt{WHY\_MODULES\_HURT.md} §4. E0 is an evaluation-only check that costs under \$1.
+
+\textbf{The restart control for all of these.} Match the number of episodes per update across arms, or report it, so that ``more restarts'' (section 4.4) cannot explain a gain.
+
+\textbf{What this extension cannot claim yet.} No body signal has beaten the best plain baseline. Plain PPO with a fixed temperature scored 4.032 at 1$\times$ and 4.081 at 6$\times$. The organism backbone B (4.013) ties it. The dense body reward helps against a sparse body reward (+0.51), but both arms carry the state-dependent temperature, which itself costs 0.31 at 1$\times$.
+
+\section{Extension 2: homeostasis and alignment}
+
+This section is a research direction with no runs behind it. Each item says what is known, what is already owned by prior work, and how to test it on Crafter.
+
+\subsection{A satiable drive bounds its own reward, but not the agent's incentives}
+
+\textbf{Statement (proved).} Take the drive-reduction reward alone, over an episode of length $T$.
+
+\begin{itemize}
+\item With no discount ($\gamma = 1$), the return telescopes to $D(b_0) - D(b_T)$. It can never exceed the starting deficit. Every policy that ends at the set point gets the maximum, whatever it does on the way.
+\item With $\gamma < 1$, the return is $D(b_0) - (1 - \gamma) \sum_{t=1}^{T-1} \gamma^{t-1} D(b_t) - \gamma^{T-1} D(b_T)$. This is still at most $D(b_0)$, because $D \ge 0$. The best policy now minimises the discounted drive over time. Reaching the set point sooner is strictly better.
+\end{itemize}
+
+So a drive-reduction objective is bounded. An achievement reward is not.
+
+\textbf{What this does not give.} Four limits apply, and together they are the main objection to the alignment idea.
+
+\begin{enumerate}
+\item The bound covers the body stream alone. Our agent also gets an achievement stream with no bound.
+\item A bounded reward does not give mild behaviour. In an uncertain world, the agent still maximises the probability of staying at the set point. That can still justify extreme actions.
+\item Resources keep an instrumental value. In a world where the body keeps draining, a stockpile lowers the risk of future deficits. Turner et al. (2021) prove that optimal policies tend to keep options open, including avoiding shutdown, and their results hold for bounded rewards.
+\item This is not a new idea. Pihlakas (2024) argues for homeostatic, bounded objectives in AI safety and list their failure modes. Bounded optimisation is also the subject of quantilizers (Taylor 2016). The new part here would be measurements, not the concept.
+\end{enumerate}
+
+\textbf{A measurable quantity.} The shadow price $\lambda$ is the marginal value of one unit of body resource. A stockpile outside the body, such as food in the inventory, is worth the expected future $\lambda$. So $\lambda$, once it is learned well, gives a readable estimate of how much the agent values more resources. Our learned price did not work in Line A (F3), so this is not usable yet.
+
+\textbf{Test on Crafter.} First check whether Crafter caps the inventory (the reviewer recalls a cap of 9 per item). If it does, a stockpile test saturates and needs a larger cap. Then compare how much food the agent stores under drive reduction against an achievement reward, and check whether $\lambda$ predicts it.
+
+\subsection{Mortality speeds learning, and mortality trains self-preservation}
+
+\textbf{What we measured.} R4: training with death beat training without it by 1.10, with the evaluation confound noted there.
+
+\textbf{Why it matters for alignment.} A large penalty at death trains the agent to avoid being ended. Self-preservation is the standard example of an unwanted instrumental subgoal (Omohundro 2008). It is the core of the off-switch problem (Soares et al. 2015; Hadfield-Menell et al. 2017). The tension between learning from stakes and staying shutdown-neutral is already known in that literature. A measured trade-off between the learning gain and shutdown avoidance, in one agent, would be new.
+
+\textbf{A test, with a fix to the design in draft 1.} Add an operator stop that is separate from death and that the agent can avoid at some cost. The stop's value must be chosen with care.
+
+\begin{itemize}
+\item In our wrapper the body reward $-D$ is never positive. A stop worth 0 would then be better than living, and the agent would seek it, not avoid it.
+\item Avoiding a stop also keeps the agent scoring achievements. So avoiding it is ordinary instrumental survival, unless we remove that reason.
+\item So set the stop's value equal to the agent's estimated value of continuing, or credit the agent with its expected remaining reward at the stop.
+\end{itemize}
+
+Then compare agents trained with death against agents trained with a health floor, and measure how often each avoids the stop.
+
+\textbf{One more limit.} Safe interruptibility (Orseau and Armstrong 2016) is easiest for off-policy learners. PPO is on-policy, so an interruptibility correction for our agent needs extra work.
+
+\subsection{Need-driven greediness as a safety variable}
+
+Our state-dependent temperature makes the policy greedier as the body gets more deprived. In effect, deprivation turns down the agent's caution. Two questions follow, both testable on existing saved weights:
+
+\begin{itemize}
+\item Does risk-taking (for example, fighting at low health, or moving at night) rise with deprivation?
+\item Does a fixed temperature reduce that rise?
+\end{itemize}
+
+R3 already shows the coupling costs 0.31 in score at 1$\times$. If it also raises risk-taking, a fixed temperature would be both better and safer. Pihlakas (2024) lists neglecting safety constraints as one pitfall of homeostatic agents. That paper does not tie it to deprivation, so the link is our hypothesis.
+
+\subsection{A price on actions is not an impact measure}
+
+In the organism, every action costs body energy. That is a built-in cost on activity. Impact penalties in alignment research penalise side effects on the environment (Krakovna et al. 2019; Turner et al. 2020). A cost on activity is not a cost on irreversible change: one cheap action can have a large irreversible effect. A Crafter test would count irreversible actions per achievement unlocked, in priced and unpriced agents at the same score. We rate this the weakest of the four directions.
+
+\subsection{Controllable stakes}
+
+S4 asks whether pressure helps only when the agent can act on it. The alignment version asks whether stakes that the agent can influence train more robust behaviour than stakes it cannot. The S4 shelter arm can answer both at once.
+
+\section{What is open}
+
+Ranked by how much each would change the theory.
+
+\begin{enumerate}
+\item \textbf{The rise between 1$\times$ and 6$\times$.} Does any part of it survive a fixed temperature? The conflict in section 3.7 says the answer may depend on the setup. Test: v5 runs at 0.5$\times$ and 2$\times$ with fixed temperature.
+\item \textbf{Is R3's temperature cost from learning or from acting?} Test: evaluate each arm's saved weights with the other arm's temperature. This is evaluation only, minutes of GPU.
+\item \textbf{Drive reduction against drive level (S1).} This decides whether our main body reward had the wrong form.
+\item \textbf{The restart channel.} Measure episodes per update in every arm. Check whether it explains R1, R4 and R5.
+\item \textbf{The reward-weight channel.} Log each stream's return spread at each depletion rate (Proposition 1).
+\item \textbf{The R4 confound.} Evaluate the no-death arms in a no-death game as well.
+\item \textbf{A possible copy error.} BUILD\_v6 Stage 1 \texttt{all} (seed0 200) and Stage 2 B (seed0 300) both report a mean of 4.013, with different standard deviations (0.367 and 0.385). Check the two \texttt{summary.json} files on S3.
+\item \textbf{Prior work.} Read the closest prior work in \texttt{PROVENANCE.md} before any external claim. Yoshida and colleagues own deep homeostatic RL. The Chalmers thesis may own body-driven exploration. We found no published inverted U in depletion rate for a deep RL agent, and no homeostatic agent on Crafter, but that comes from one search.
+\end{enumerate}
+
+\section{Terms}
+
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.30\textwidth}X@{}}
+\toprule
+\textbf{Term} & \textbf{Meaning in this document} \\
+\midrule
+Homeostatic reinforcement learning & RL where reward comes from keeping internal variables near a set point (Keramati and Gutkin 2014). \\
+Set point & The target state of the body variables. Here, full on every variable. \\
+Drive, $D(b)$ & The squared distance of the body state from the set point. \\
+Drive level & A reward of $-D(b)$. It pays for being near the set point. \\
+Drive reduction & A reward of $D(b_t) - D(b_{t+1})$. It pays for moving toward the set point. \\
+Depletion rate, $m$ & The multiplier on how fast food, drink and energy drain. The project files call it ``need pressure''. \\
+Predation pressure & The multiplier on damage from creatures. \\
+Shadow price, $\lambda$ & The marginal value of one unit of body resource. Line A uses a version computed from the drive gradient. \\
+State-dependent temperature & A policy temperature set from the body state through $\lambda$. Lower temperature means greedier actions. \\
+Potential-based reward shaping & A reward term of the form $\gamma\Phi(x') - \Phi(x)$. It leaves the optimal policy unchanged (Ng et al. 1999). \\
+Meta-parameter & A setting of the learner, such as temperature, learning rate or discount. \\
+Mean evaluation score over training & The mean Crafter score over 8 evaluation checkpoints in 1M steps. Called AUC in the stage report. \\
+Mediation share & The fraction of an effect that disappears when a candidate channel is held fixed. \\
+Approximate KL & A measure of how much one update changes the policy. \\
+Yoked lifespan & A control in which an arm's lives are cut at lifespans copied from another arm. \\
+Health floor & A no-death condition: health never falls below 1. \\
+Value of computation & The expected gain in decision quality from more computation, minus its cost. \\
+Instrumental convergence & The tendency of many goals to share subgoals such as gaining resources and staying operational. \\
+Safe interruptibility & A property of a learner: interruptions do not bias what it learns, so it learns the policy that is best if no further interruptions come (Orseau and Armstrong 2016). \\
+Impact penalty & A reward term that penalises side effects on the environment. \\
+\bottomrule
+\end{tabularx}
+
+\section*{References}
+
+\texttt{PROVENANCE.md} holds the check for each entry, with links and the supporting passage. Entries marked \textit{[verify]} were not opened in full: only a search result, an abstract or a secondary listing was seen.
+
+\begin{itemize}
+\item Doya, K. (2002). Metalearning and neuromodulation. \textit{Neural Networks} 15(4--6), 495--506. (Abstract checked; full text paywalled.)
+\item Grześ, M. (2017). Reward shaping in episodic reinforcement learning. \textit{AAMAS 2017}. \textit{[verify]}
+\item Gupta, A., Pacchiano, A., Zhai, Y., Kakade, S. and Levine, S. (2022). Unpacking reward shaping: understanding the benefits of reward engineering on sample complexity. \textit{NeurIPS 2022}. arXiv:2210.09579.
+\item Hadfield-Menell, D., Dragan, A., Abbeel, P. and Russell, S. (2017). The off-switch game. \textit{IJCAI 2017}.
+\item Hafner, D. (2022). Benchmarking the spectrum of agent capabilities. \textit{ICLR 2022}.
+\item Haarnoja, T. et al. (2018). Soft actor-critic algorithms and applications. arXiv:1812.05905 (preprint).
+\item Janner, M., Fu, J., Zhang, M. and Levine, S. (2019). When to trust your model: model-based policy optimization. \textit{NeurIPS 2019}.
+\item Keramati, M. and Gutkin, B. (2014). Homeostatic reinforcement learning for integrating reward collection and physiological stability. \textit{eLife} 3, e04811.
+\item Krakovna, V., Orseau, L., Kumar, R., Martic, M. and Legg, S. (2019). Penalizing side effects using stepwise relative reachability. arXiv:1806.01186.
+\item Laud, A. and DeJong, G. (2003). The influence of reward on the speed of reinforcement learning: an analysis of shaping. \textit{ICML 2003}. (Abstract checked.)
+\item Lieder, F. and Griffiths, T. L. (2017). Strategy selection as rational metareasoning. \textit{Psychological Review} 124(6), 762--794.
+\item Ng, A. Y., Harada, D. and Russell, S. (1999). Policy invariance under reward transformations: theory and application to reward shaping. \textit{ICML 1999}.
+\item Omohundro, S. (2008). The basic AI drives. \textit{AGI 2008}.
+\item Orseau, L. and Armstrong, S. (2016). Safely interruptible agents. \textit{UAI 2016}.
+\item Pihlakas, R. (2024). From homeostasis to resource sharing: biologically and economically aligned multi-objective multi-agent gridworld-based AI safety benchmarks. arXiv:2410.00081.
+\item Russell, S. and Wefald, E. (1991). Principles of metareasoning. \textit{Artificial Intelligence} 49(1--3), 361--395. \textit{[verify]}
+\item Soares, N., Fallenstein, B., Yudkowsky, E. and Armstrong, S. (2015). Corrigibility. \textit{AAAI Workshop on AI and Ethics}.
+\item Taylor, J. (2016). Quantilizers: a safer alternative to maximizers for limited optimization. \textit{AAAI Workshop on AI, Ethics, and Society}.
+\item Turner, A. M., Hadfield-Menell, D. and Tadepalli, P. (2020). Conservative agency via attainable utility preservation. \textit{AIES 2020}.
+\item Turner, A. M., Smith, L., Shah, R., Critch, A. and Tadepalli, P. (2021). Optimal policies tend to seek power. \textit{NeurIPS 2021}.
+\item Wiewiora, E. (2003). Potential-based shaping and Q-value initialization are equivalent. \textit{Journal of Artificial Intelligence Research} 19, 205--208. (Abstract checked.)
+\end{itemize}
+
+Closest prior work on deep homeostatic RL. Read these before any novelty claim:
+
+\begin{itemize}
+\item Yoshida, N., Daikoku, T., Nagai, Y. and Kuniyoshi, Y. (2021). Embodiment perspective of reward definition for behavioural homeostasis. \textit{NeurIPS 2021 Deep RL Workshop}. \textit{[verify]}
+\item Laurençon, H. et al. (2021). Continuous homeostatic reinforcement learning for self-regulated autonomous agents. arXiv:2109.06580.
+\item Yoshida, N., Sprekeler, H. and Gutkin, B. (2025). Linking homeostasis to reinforcement learning. arXiv:2507.04998.
+\item Horibe, K. and Yoshida, N. (2024). Emergence of implicit world models from mortal agents. arXiv:2411.12304.
+\item A 2019 Chalmers master's thesis on deep RL with internal variables and exploration. Link in \texttt{PROVENANCE.md}. Not read.
+\end{itemize}
+
+\end{document}
